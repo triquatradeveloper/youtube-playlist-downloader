@@ -34,3 +34,7 @@ Make sure you have **Python 3.8+** installed.
    ```bash
    git clone https://github.com/yourusername/playlist-downloader.git
    cd playlist-downloader
+
+2.**CMD***
+  ```
+  pip install flet yt-dlp pywin32 spotdl
