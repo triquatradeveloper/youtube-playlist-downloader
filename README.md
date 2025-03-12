@@ -1,5 +1,19 @@
 # Playlist Downloader 🎵🚀
 
+
+
+
+![image](https://github.com/user-attachments/assets/3928b286-3579-4c9a-9a38-fd9c0ff07513)
+
+
+
+
+
+
+
+
+
+
 A sleek, interactive tool that lets you download your favorite playlists from YouTube and Spotify—all through a modern UI built with Flet! This project combines the power of **yt_dlp**, **spotdl**, and **FFmpeg** to extract high-quality audio, merge tracks, and provide a responsive, feature-rich experience with dark mode support, real-time progress tracking, and more.
 
 ---
