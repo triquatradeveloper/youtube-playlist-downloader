@@ -1,608 +1,339 @@
+import sys
 import os
 import threading
 import subprocess
 import datetime
-import tempfile
-import glob
-import flet as ft
+import requests
 import yt_dlp
-import pythoncom
-import win32com.client
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
+    QVBoxLayout, QHBoxLayout, QComboBox, QProgressBar, QFileDialog, QTextEdit,
+    QMessageBox, QListWidget, QListWidgetItem
+)
+from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtCore import Qt
 
-# Default thumbnail placeholder URL
-DEFAULT_THUMBNAIL = "https://via.placeholder.com/320x180?text=No+Thumbnail"
-
-# Logos for header
+# Constants and history file
+HISTORY_FILE = "download_history.txt"
+DEFAULT_THUMBNAIL = "https://dummyimage.com/320x180/cccccc/ffffff&text=No+Thumbnail"
 YOUTUBE_LOGO = "https://upload.wikimedia.org/wikipedia/commons/4/42/YouTube_icon_%282013-2017%29.png"
-SPOTIFY_LOGO = "https://storage.googleapis.com/pr-newsroom-wp/1/2023/05/Spotify_Primary_Logo_RGB_Green.png"
+SPOTIFY_LOGO = "https://www.vectorlogo.zone/logos/spotify/spotify-icon.svg"
 
-playlist_data = None  # Global variable for playlist info
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
 
-def get_folder():
-    pythoncom.CoInitialize()
-    try:
-        shell = win32com.client.Dispatch("Shell.Application")
-        folder = shell.BrowseForFolder(0, "Select Save Location", 0, 0)
-        if folder is None:
-            return ""
-        folder_path = folder.Items().Item().Path
-        return folder_path
-    finally:
-        pythoncom.CoUninitialize()
+def save_history(text):
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        f.write(text + "\n")
 
-def download_spotify_album(album_url, output_path="downloads/", audio_format="flac"):
-    command = f"spotdl --output \"{output_path}\" --audio-format {audio_format} {album_url}"
-    subprocess.run(command, shell=True)
+# Custom logger to suppress yt_dlp warnings
+class MyLogger:
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): print(msg)
 
-def combine_all_audio_files(download_path, playlist_data, audio_format):
-    file_list_path = os.path.join(download_path, "file_list.txt")
-    lines = []
-    for entry in playlist_data.get("entries", []):
-        title = entry.get("title", "")
-        pattern = os.path.join(download_path, f"{title}*.{audio_format}")
-        files = glob.glob(pattern)
-        if files:
-            filename = os.path.basename(files[0])
-            lines.append(f"file '{filename}'")
-        else:
-            print(f"Warning: Could not find file for {title}")
-    with open(file_list_path, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(line + "\n")
-    output_file = os.path.join(download_path, f"combined.{audio_format}")
-    cmd = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", file_list_path, "-c", "copy", output_file]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        cmd = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", file_list_path, "-acodec", "copy", output_file]
-        result = subprocess.run(cmd, capture_output=True)
-    return output_file
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Playlist Downloader")
+        self.setGeometry(100, 100, 900, 700)
+        self.playlist_data = None
+        self.init_ui()
 
-def main(page: ft.Page):
-    global playlist_data
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout()
 
-    # Window settings
-    page.window.width = 1000
-    page.window.height = 800
-    page.window.resizable = True
+        # Title label
+        title_lbl = QLabel("Playlist Downloader")
+        title_lbl.setFont(QFont("Segoe UI", 24, QFont.Bold))
+        title_lbl.setAlignment(Qt.AlignCenter)
+        title_lbl.setStyleSheet("color: #FFD700;")
+        main_layout.addWidget(title_lbl)
 
-    # Theme Colors
-    light_bg = "#E6F7FF"
-    dark_bg = "#2C2C2C"
-    # For other boxes we now use transparent backgrounds
-    transparent_bg = "transparent"
+        # Logo layout (YouTube and Spotify logos)
+        logo_layout = QHBoxLayout()
+        self.youtube_logo = QLabel()
+        self.youtube_logo.setPixmap(QPixmap(YOUTUBE_LOGO).scaled(50, 50, Qt.KeepAspectRatio))
+        logo_layout.addWidget(self.youtube_logo)
+        self.spotify_logo = QLabel()
+        self.spotify_logo.setPixmap(QPixmap(SPOTIFY_LOGO).scaled(50, 50, Qt.KeepAspectRatio))
+        logo_layout.addWidget(self.spotify_logo)
+        main_layout.addLayout(logo_layout)
 
-    dark_mode = {"value": False}
-    page.title = "Playlist Downloader"
-    page.bgcolor = light_bg
-    page.padding = 20
+        # URL input and Add URL button
+        url_layout = QHBoxLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("Enter YouTube playlist URL or single video URL...")
+        url_layout.addWidget(QLabel("Playlist URL:"))
+        url_layout.addWidget(self.url_edit)
+        self.add_url_btn = QPushButton("Add URL")
+        self.add_url_btn.setStyleSheet("background-color: #4CAF50; color: white; border-radius: 8px;")
+        self.add_url_btn.clicked.connect(self.on_add_url)
+        url_layout.addWidget(self.add_url_btn)
+        main_layout.addLayout(url_layout)
 
-    # ----- Download History Panel -----
-    download_history_list = []
-    download_history = ft.Column(
-        controls=[],
-        spacing=10,
-        scroll=True,
-        expand=True,
-        alignment=ft.MainAxisAlignment.CENTER
-    )
+        # Dropdowns for Source and Format
+        dropdown_layout = QHBoxLayout()
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(["YouTube", "Spotify"])
+        self.source_combo.setStyleSheet("color: black;")
+        dropdown_layout.addWidget(QLabel("Source:"))
+        dropdown_layout.addWidget(self.source_combo)
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["FLAC", "MP3", "HD Video"])
+        self.format_combo.setStyleSheet("color: black;")
+        dropdown_layout.addWidget(QLabel("Format:"))
+        dropdown_layout.addWidget(self.format_combo)
+        main_layout.addLayout(dropdown_layout)
 
-    def add_download_history(item_text: str):
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        history_item = ft.Text(
-            f"[{timestamp}] {item_text}",
-            size=14,
-            color="white" if dark_mode["value"] else "black",
-        )
-        download_history.controls.append(history_item)
-        download_history_list.append(history_item)
-        download_history.update()
+        # Save location and Browse button
+        loc_layout = QHBoxLayout()
+        self.loc_edit = QLineEdit()
+        self.loc_edit.setReadOnly(True)
+        loc_layout.addWidget(QLabel("Save Location:"))
+        loc_layout.addWidget(self.loc_edit)
+        self.browse_btn = QPushButton("Browse")
+        self.browse_btn.setStyleSheet("background-color: #3faffa; color: white; border-radius: 8px;")
+        self.browse_btn.clicked.connect(self.on_browse)
+        loc_layout.addWidget(self.browse_btn)
+        main_layout.addLayout(loc_layout)
 
-    def clear_history(e):
-        download_history.controls.clear()
-        download_history_list.clear()
-        download_history.update()
+        # Video list
+        self.video_list = QListWidget()
+        self.video_list.setStyleSheet("background-color: #000000; color: white;")
+        main_layout.addWidget(self.video_list)
 
-    clear_history_button = ft.ElevatedButton(
-        text="Clear History",
-        width=150,
-        bgcolor="#d9534f",
-        color="white",
-        tooltip="Clear all download history",
-        on_click=clear_history
-    )
+        # Log display and progress bar
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setStyleSheet("background-color: #2e2e2e; color: white; border-radius: 8px; padding: 10px;")
+        main_layout.addWidget(self.log_edit)
+        self.progress_bar = QProgressBar()
+        main_layout.addWidget(self.progress_bar)
 
-    # ----- Header -----
-    header_logo = ft.Image(
-        src=YOUTUBE_LOGO,
-        width=50,
-        height=50,
-        fit=ft.ImageFit.CONTAIN
-    )
-    header_title = ft.Text(
-        "YouTube Downloader",
-        size=32,
-        weight="bold",
-        color="#FF0000"
-    )
-    dark_mode_switch = ft.Switch(label="Dark Mode", value=False)
-    settings_button = ft.IconButton(
-        icon=ft.Icons.SETTINGS,
-        tooltip="Settings",
-        on_click=lambda e: open_settings_modal()
-    )
-    header = ft.Container(
-        content=ft.Row(
-            controls=[
-                header_logo,
-                header_title,
-                ft.Container(expand=True),
-                dark_mode_switch,
-                settings_button,
-            ],
-            alignment=ft.MainAxisAlignment.CENTER,
-            spacing=20,
-        ),
-        padding=15,
-        border_radius=8,
-        gradient=ft.LinearGradient(
-            begin=ft.alignment.top_left,
-            end=ft.alignment.bottom_right,
-            colors=["#FFEEAD", "#FF6F69"],
-        ),
-        shadow=ft.BoxShadow(blur_radius=10, color="grey", spread_radius=2)
-    )
+        # Download and Reset buttons
+        btn_layout = QHBoxLayout()
+        self.download_btn = QPushButton("Download")
+        self.download_btn.setStyleSheet("background-color: #FF6347; color: white; border-radius: 8px;")
+        self.download_btn.clicked.connect(self.on_download)
+        btn_layout.addWidget(self.download_btn)
+        self.reset_btn = QPushButton("Reset")
+        self.reset_btn.setStyleSheet("background-color: #808080; color: white; border-radius: 8px;")
+        self.reset_btn.clicked.connect(self.on_reset)
+        btn_layout.addWidget(self.reset_btn)
+        main_layout.addLayout(btn_layout)
 
-    def open_settings_modal():
-        dlg = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Settings & Info", weight="bold"),
-            content=ft.Text("Playlist Downloader v2.0\nEnjoy the new animations and features!"),
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        def close_dialog(e):
-            dlg.open = False
-            page.update()
-        dlg.actions = [ft.TextButton("Close", on_click=close_dialog)]
-        page.overlay.append(dlg)
-        dlg.open = True
-        page.update()
+        # History display
+        history_lbl = QLabel("Download History:")
+        history_lbl.setStyleSheet("color: white; font-size: 18px;")
+        main_layout.addWidget(history_lbl)
+        self.history_edit = QTextEdit()
+        self.history_edit.setReadOnly(True)
+        self.history_edit.setPlainText(load_history())
+        self.history_edit.setStyleSheet("background-color: #3e3e3e; color: white; border-radius: 8px; padding: 10px;")
+        main_layout.addWidget(self.history_edit)
 
-    # ----- Dropdowns -----
-    source_dropdown = ft.Dropdown(
-        label="Select Source",
-        width=200,
-        options=[
-            ft.dropdown.Option("YouTube"),
-            ft.dropdown.Option("Spotify")
-        ],
-        value="YouTube",
-        color="black",
-    )
-    format_dropdown = ft.Dropdown(
-        label="Audio Format",
-        width=200,
-        options=[
-            ft.dropdown.Option("FLAC"),
-            ft.dropdown.Option("MP3")
-        ],
-        value="FLAC",
-        color="#800080",
-    )
-    def on_source_change(e):
-        if source_dropdown.value == "YouTube":
-            header_logo.src = YOUTUBE_LOGO
-            header_title.value = "YouTube Downloader"
-            header_title.color = "#FF0000"
-            playlist_url_field.label = "Playlist URL"
-            playlist_url_field.hint_text = "Enter YouTube playlist URL..."
-            log_text.value = "YouTube selected."
-        else:
-            header_logo.src = SPOTIFY_LOGO
-            header_title.value = "Spotify Downloader"
-            header_title.color = "#1DB954"
-            playlist_url_field.label = "Spotify Album Download"
-            playlist_url_field.hint_text = "Enter Spotify album URL..."
-            log_text.value = "Spotify selected."
-        info_loaded["value"] = False
-        playlist_url_field.visible = True
-        add_url_button.visible = True
-        page.update()
-    source_dropdown.on_change = on_source_change
+        central.setLayout(main_layout)
 
-    def on_format_change(e):
-        if format_dropdown.value == "FLAC":
-            format_dropdown.color = "#800080"
-        else:
-            format_dropdown.color = "#FFA500"
-        page.update()
-    format_dropdown.on_change = on_format_change
+    def log(self, message):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log_edit.append(f"[{ts}] {message}")
 
-    # ----- URL Input & Add URL Button -----
-    playlist_url_field = ft.TextField(
-        label="Playlist URL",
-        hint_text="Enter YouTube playlist URL...",
-        width=500,
-        color="black",
-        # Removed explicit border and white background
-        border_color=transparent_bg
-    )
-    add_url_button = ft.ElevatedButton(
-        text="Add URL",
-        bgcolor="#e0e0e0",
-        color="black",
-    )
-    def on_add_url_click(e):
-        if not playlist_url_field.value.strip():
-            log_text.value = "Please enter a valid URL."
-            page.update()
+    def on_add_url(self):
+        url = self.url_edit.text().strip()
+        if not url.lower().startswith("http"):
+            QMessageBox.warning(self, "Invalid URL", "Please enter a valid URL (starting with http/https).")
             return
-        playlist_url_field.read_only = True
-        add_url_button.visible = False
-        download_location_field.visible = True
-        browse_button.visible = True
-        log_text.value = "URL added. Please select a save location."
-        page.update()
-    add_url_button.on_click = on_add_url_click
+        self.log("URL added. Please select a save location.")
+        # Check if the URL is for a playlist or a single video
+        if 'playlist' in url:
+            self.log("You entered a playlist URL.")
+        else:
+            self.log("You entered a single video URL.")
 
-    # ----- Save Location & Browse Button -----
-    download_location_field = ft.TextField(
-        label="Save Location",
-        width=500,
-        read_only=True,
-        color="black",
-        # Remove white background and border:
-        border_color=transparent_bg,
-        bgcolor=transparent_bg,
-        visible=False
-    )
-    browse_button = ft.IconButton(
-        icon=ft.Icons.FOLDER_OPEN,
-        tooltip="Browse for Save Location",
-        icon_color="black",
-        visible=False,
-    )
-    def on_browse_click(e):
-        folder_selected = get_folder()
-        if folder_selected:
-            download_location_field.value = folder_selected
-            progress_bar.visible = True
-            log_text.visible = True
-            download_button.visible = True
-            page.update()
-            # Remove any white background for thumbnail container
-            thumbnail_container.bgcolor = transparent_bg
-            thumbnail_container.opacity = 0
-            thumbnail_container.offset = ft.Offset(-1, 0)
-            thumbnail_image.src = DEFAULT_THUMBNAIL
-            thumbnail_container.visible = True
-            page.update()
-            if source_dropdown.value == "YouTube":
-                threading.Thread(target=load_playlist_info, daemon=True).start()
+    def on_browse(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Save Location")
+        if folder:
+            self.loc_edit.setText(folder)
+            if self.source_combo.currentText() == "YouTube":
+                threading.Thread(target=self.load_playlist_info, daemon=True).start()
             else:
-                log_text.value = "Ready to download Spotify album."
-            page.update()
-    browse_button.on_click = on_browse_click
+                self.log("Ready to download Spotify album.")
 
-    # ----- Playlist Info & Thumbnail -----
-    thumbnail_image = ft.Image(
-        src="",
-        width=320,
-        height=180,
-        fit=ft.ImageFit.CONTAIN,
-    )
-    thumbnail_container = ft.Container(
-        content=thumbnail_image,
-        visible=False,
-        opacity=0,
-        offset=ft.Offset(0, 0),
-        bgcolor=transparent_bg  # Transparent background instead of white
-    )
-    playlist_title_text = ft.Text(
-        "",
-        visible=False,
-        color="black",
-        size=18,
-        weight="bold",
-    )
-    playlist_info_text = ft.Text(
-        "",
-        visible=False,
-        color="black",
-        size=16,
-    )
-    def load_playlist_info():
-        global playlist_data
-        url = playlist_url_field.value.strip()
+    def load_playlist_info(self):
+        url = self.url_edit.text().strip()
         if not url:
-            log_text.value = "No URL provided."
-            page.update()
+            self.log("No URL provided.")
             return
-        opts = {"quiet": True, "skip_download": True, "extract_flat": True}
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": True,
+            "logger": MyLogger(),
+            "headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        }
+
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                playlist_data = ydl.extract_info(url, download=False)
-            playlist_title = playlist_data.get("title", "Playlist")
-            playlist_title_text.value = playlist_title
-            playlist_title_text.visible = True
-            if "entries" in playlist_data and playlist_data["entries"]:
-                count = len(playlist_data["entries"])
-                playlist_info_text.value = f"Total Videos: {count}"
-                playlist_info_text.visible = True
-            else:
-                playlist_info_text.value = "Single Video"
-                playlist_info_text.visible = True
-            # Try to get thumbnail from first video; if missing, fetch full info.
-            thumb = ""
-            if "entries" in playlist_data and playlist_data["entries"]:
-                first = playlist_data["entries"][0]
-                thumb = first.get("thumbnail", "")
-                if not thumb:
-                    video_id = first.get("id", None)
-                    if video_id:
-                        video_full_url = f"https://www.youtube.com/watch?v={video_id}"
-                        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl2:
-                            full_info = ydl2.extract_info(video_full_url, download=False)
-                            thumb = full_info.get("thumbnail", "")
-            else:
-                thumb = playlist_data.get("thumbnail", "")
-            thumbnail_image.src = thumb if thumb else DEFAULT_THUMBNAIL
-            thumbnail_container.opacity = 1
-            thumbnail_container.offset = ft.Offset(0, 0)
-            thumbnail_container.update()
-            log_text.value = "Playlist loaded."
-            info_loaded["value"] = True
-        except Exception as ex:
-            log_text.value = f"Error loading playlist: {ex}"
-        finally:
-            page.update()
+                info = ydl.extract_info(url, download=False)
 
-    # ----- Download Button, Progress Bar & Log Text -----
-    download_button = ft.ElevatedButton(
-        text="Download",
-        width=200,
-        bgcolor="#e0e0e0",
-        color="black",
-        visible=False,
-    )
-    progress_bar = ft.ProgressBar(
-        width=500,
-        value=0,
-        visible=False,
-    )
-    log_text = ft.Text(
-        value="",
-        color="black",
-        size=16,
-        visible=False,
-    )
-    info_loaded = {"value": False}
-    def download_content():
-        if source_dropdown.value == "YouTube" and not info_loaded["value"]:
-            page.snack_bar = ft.SnackBar(
-                content=ft.Text("Please wait for loading info..."),
-                bgcolor="#FFA500",
-                open=True,
-            )
-            page.snack_bar.open = True
-            page.update()
+            video_count = len(info.get("entries", [])) if "entries" in info else 1
+            title = info.get("title", "Playlist")
+            self.playlist_data = info
+            self.log(f"Playlist '{title}' loaded with {video_count} videos.")
+
+            # Display playlist name and video titles
+            self.video_list.clear()  # Clear the previous list
+            for entry in info.get("entries", []):
+                item = QListWidgetItem(entry.get("title", "Unknown Video"))
+                item.setBackground(Qt.black)  # Set background to black
+                self.video_list.addItem(item)
+
+        except Exception as ex:
+            self.log(f"Error loading playlist: {ex}")
+
+    def on_download(self):
+        if self.source_combo.currentText() == "YouTube" and not self.playlist_data:
+            self.log("Please wait for playlist info to load...")
             return
-        url = playlist_url_field.value.strip()
-        download_path = download_location_field.value.strip()
-        if not url:
-            log_text.value = "Please enter a URL."
-            page.update()
+        folder = self.loc_edit.text().strip()
+        if not folder:
+            self.log("Please select a save location.")
             return
-        if not download_path:
-            log_text.value = "Please select a save location."
-            page.update()
-            return
-        audio_format = format_dropdown.value.lower()
-        if source_dropdown.value == "Spotify":
-            download_button.disabled = True
-            progress_bar.visible = False
-            log_text.value = "Starting Spotify download..."
-            page.update()
+        threading.Thread(target=self.download_content, daemon=True).start()
+
+    def download_content(self):
+        url = self.url_edit.text().strip()
+        folder = self.loc_edit.text().strip()
+        fmt = self.format_combo.currentText()
+        audio_format = fmt.lower()
+        self.download_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        
+        # Determine total number of videos (default to 1 for single video)
+        total_videos = 1
+        if self.playlist_data and "entries" in self.playlist_data and isinstance(self.playlist_data["entries"], list):
+            total_videos = len(self.playlist_data["entries"])
+        
+        progress_state = {"videos_downloaded": 0, "total_videos": total_videos}
+
+        if self.source_combo.currentText() == "Spotify":
+            self.log("Starting Spotify download...")
             try:
-                download_spotify_album(url, output_path=download_path, audio_format=audio_format)
-                log_text.value = "Spotify download completed successfully."
-                add_download_history("Spotify album downloaded.")
+                cmd = f'spotdl --output "{folder}" --audio-format {audio_format} {url}'
+                subprocess.run(cmd, shell=True)
+                self.log("Spotify download completed successfully.")
+                history_line = f"{datetime.datetime.now().strftime('%H:%M:%S')} Spotify album downloaded."
+                save_history(history_line)
+                self.history_edit.append(history_line)
             except Exception as ex:
-                log_text.value = f"Error: {ex}"
-            finally:
-                download_button.disabled = False
-                page.update()
+                self.log(f"Error: {ex}")
         else:
-            download_button.disabled = True
-            progress_bar.value = 0
-            log_text.value = "Starting YouTube download..."
-            page.update()
-            total_videos = 1
-            if playlist_data and "entries" in playlist_data and len(playlist_data["entries"]) > 1:
-                total_videos = len(playlist_data["entries"])
-            progress_state = {"videos_downloaded": 0, "total_videos": total_videos}
-            def progress_hook(d):
-                if d["status"] == "downloading":
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                    if total:
-                        downloaded = d.get("downloaded_bytes", 0)
-                        percentage = downloaded / total
-                        overall = (progress_state["videos_downloaded"] + percentage) / progress_state["total_videos"]
-                        progress_bar.value = overall
-                        speed = d.get("download_speed", 0)
-                        if speed:
-                            speed_kb = speed / 1024
-                            log_text.value = f"Downloading: {overall*100:.2f}% at {speed_kb:.2f} KB/s"
-                        else:
-                            log_text.value = f"Downloading: {overall*100:.2f}%"
-                    else:
-                        log_text.value = "Downloading..."
-                    progress_bar.update()
-                    page.update()
-                elif d["status"] == "finished":
-                    progress_state["videos_downloaded"] += 1
-                    overall = progress_state["videos_downloaded"] / progress_state["total_videos"]
-                    progress_bar.value = overall
-                    log_text.value = f"Completed video {progress_state['videos_downloaded']} of {progress_state['total_videos']}"
-                    progress_bar.update()
-                    page.update()
-            postprocessor = {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3" if audio_format=="mp3" else "flac",
-                "preferredquality": "192" if audio_format=="mp3" else "1706",
-            }
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": os.path.join(download_path, "%(title)s.%(ext)s"),
-                "postprocessors": [postprocessor],
-                "progress_hooks": [progress_hook],
-            }
+            self.log("Starting YouTube download...")
+            
+            if fmt == "HD Video":
+                ydl_opts = {
+                    "format": "bestvideo[height<=1080]+bestaudio/best",
+                    "merge_output_format": "mp4",
+                    "outtmpl": os.path.join(folder, "%(title)s.%(ext)s"),
+                    "progress_hooks": [self.make_progress_hook(progress_state)],
+                    "no_warnings": True,
+                    "quiet": True,
+                    "logger": MyLogger(),
+                }
+            else:
+                postprocessor = {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3" if audio_format == "mp3" else "flac",
+                    "preferredquality": "192" if audio_format == "mp3" else "1706",
+                }
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": os.path.join(folder, "%(title)s.%(ext)s"),
+                    "postprocessors": [postprocessor],
+                    "progress_hooks": [self.make_progress_hook(progress_state)],
+                    "no_warnings": True,
+                    "quiet": True,
+                    "logger": MyLogger(),
+                }
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
-                log_text.value = "Download completed successfully."
-                add_download_history("YouTube playlist downloaded.")
-                if total_videos > 1:
-                    combined_file = combine_all_audio_files(download_path, playlist_data, audio_format)
-                    log_text.value = f"Combined into {os.path.basename(combined_file)}"
-                    add_download_history(f"Combined file: {os.path.basename(combined_file)}")
+                if fmt == "HD Video":
+                    self.log("HD Video download completed successfully.")
+                    history_line = f"{datetime.datetime.now().strftime('%H:%M:%S')} YouTube HD video downloaded."
+                else:
+                    self.log("Download completed successfully.")
+                    history_line = f"{datetime.datetime.now().strftime('%H:%M:%S')} YouTube playlist downloaded."
+                save_history(history_line)
+                self.history_edit.append(history_line)
             except Exception as ex:
-                log_text.value = f"Error: {ex}"
-            finally:
-                download_button.disabled = False
-                page.update()
-    download_button.on_click = lambda e: threading.Thread(target=download_content, daemon=True).start()
+                self.log(f"Error: {ex}")
+        self.download_btn.setEnabled(True)
 
-    # ----- Reset Button -----
-    reset_button = ft.ElevatedButton(
-        text="Reset",
-        width=200,
-        bgcolor="#e0e0e0",
-        color="black"
-    )
-    def on_reset_hover(e):
-        reset_button.bgcolor = "#cccccc" if e.data == "true" else "#e0e0e0"
-        reset_button.update()
-    reset_button.on_hover = on_reset_hover
-    def reset_ui(e):
-        playlist_url_field.value = ""
-        playlist_url_field.read_only = False
-        add_url_button.visible = True
-        download_location_field.value = ""
-        download_location_field.visible = False
-        browse_button.visible = False
-        thumbnail_image.src = ""
-        thumbnail_container.visible = False
-        thumbnail_container.opacity = 0
-        playlist_title_text.value = ""
-        playlist_title_text.visible = False
-        playlist_info_text.value = ""
-        playlist_info_text.visible = False
-        download_button.visible = False
-        progress_bar.value = 0
-        progress_bar.visible = False
-        log_text.value = ""
-        log_text.visible = False
-        info_loaded["value"] = False
-        page.update()
-    reset_button.on_click = reset_ui
+    def make_progress_hook(self, progress_state):
+        def hook(d):
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                if total:
+                    downloaded = d.get("downloaded_bytes", 0)
+                    percentage = downloaded / total
+                    overall = (progress_state["videos_downloaded"] + percentage) / progress_state["total_videos"]
+                    self.progress_bar.setValue(int(overall * 100))
+                    self.log(f"Downloading: {overall * 100:.2f}%")
+            elif d["status"] == "finished":
+                progress_state["videos_downloaded"] += 1
+                overall = progress_state["videos_downloaded"] / progress_state["total_videos"]
+                self.progress_bar.setValue(int(overall * 100))
+                self.log(f"Completed video {progress_state['videos_downloaded']} of {progress_state['total_videos']}")
+        return hook
 
-    # ----- Dark Mode Toggle -----
-    def toggle_theme(e):
-        dark_mode["value"] = dark_mode_switch.value
-        if dark_mode["value"]:
-            page.bgcolor = dark_bg
-            playlist_url_field.color = "white"
-            playlist_url_field.border_color = "white"
-            download_location_field.color = "white"
-            download_location_field.border_color = "white"
-        else:
-            page.bgcolor = light_bg
-            playlist_url_field.color = "black"
-            playlist_url_field.border_color = "black"
-            download_location_field.color = "black"
-            download_location_field.border_color = "black"
-        history_panel.bgcolor = "#444444" if dark_mode["value"] else "#DDDDDD"
-        header.update()
-        history_panel.update()
-        control_panel.update()
-        page.update()
-    dark_mode_switch.on_change = toggle_theme
+    def on_reset(self):
+        self.url_edit.clear()
+        self.loc_edit.clear()
+        self.video_list.clear()
+        self.log_edit.clear()
+        self.playlist_data = None
 
-    # ----- Main Layout -----
-    control_panel = ft.Column(
-        controls=[
-            header,
-            ft.Divider(height=2, color="black"),
-            ft.Row(
-                controls=[source_dropdown, format_dropdown],
-                spacing=20,
-                alignment=ft.MainAxisAlignment.CENTER
-            ),
-            ft.Container(
-                content=ft.Column(
-                    controls=[
-                        ft.Row(controls=[playlist_url_field, add_url_button], spacing=10, alignment=ft.MainAxisAlignment.CENTER),
-                        ft.Row(controls=[download_location_field, browse_button], spacing=10, alignment=ft.MainAxisAlignment.CENTER),
-                    ],
-                    spacing=15,
-                    alignment=ft.MainAxisAlignment.CENTER
-                ),
-                padding=10,
-                border=ft.border.all(1, "black"),
-                border_radius=5,
-                bgcolor=transparent_bg  # Transparent background
-            ),
-            ft.Container(
-                content=ft.Column(
-                    controls=[
-                        playlist_title_text,
-                        playlist_info_text,
-                        thumbnail_container,
-                    ],
-                    spacing=10,
-                    alignment=ft.MainAxisAlignment.CENTER
-                ),
-                padding=10,
-                # Remove border and background for playlist info area
-                bgcolor=transparent_bg,
-                border_radius=5,
-            ),
-            download_button,
-            progress_bar,
-            log_text,
-            ft.Row(
-                controls=[reset_button, clear_history_button],
-                alignment=ft.MainAxisAlignment.CENTER,
-                spacing=20
-            ),
-        ],
-        spacing=20,
-        alignment=ft.MainAxisAlignment.CENTER,
-        expand=True
-    )
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    
+    # Apply an advanced dark style using Qt Stylesheets
+    app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QMainWindow { background-color: #1e1e1e; }
+        QLabel { color: #FFFFFF; font-size: 18px; font-weight: bold; }
+        QLineEdit, QComboBox, QTextEdit {
+            background-color: #3E3E3E; 
+            color: #FFFFFF; 
+            border: 1px solid #555555; 
+            border-radius: 8px; 
+            padding: 4px;
+        }
+        QPushButton { 
+            background-color: #FF6347; 
+            color: white; 
+            border-radius: 12px; 
+            padding: 10px 20px;
+        }
+        QPushButton:hover { background-color: #FF4500; }
+        QProgressBar { 
+            background-color: #555555; 
+            color: white; 
+            border: 1px solid #444444; 
+            border-radius: 8px; 
+            text-align: center; 
+        }
+        QProgressBar::chunk { background-color: #FF6347; border-radius: 8px; }
+    """)
 
-    history_panel = ft.Container(
-        content=ft.Column(
-            controls=[
-                ft.Text("Download History", size=20, weight="bold", color="white" if dark_mode["value"] else "black"),
-                ft.Divider(color="white" if dark_mode["value"] else "black"),
-                download_history,
-            ],
-            spacing=10,
-            alignment=ft.MainAxisAlignment.CENTER
-        ),
-        width=300,
-        padding=15,
-        border_radius=8,
-        bgcolor="#444444" if dark_mode["value"] else "#DDDDDD",
-        shadow=ft.BoxShadow(blur_radius=10, color="grey", spread_radius=2)
-    )
-
-    main_layout = ft.Row(
-        controls=[control_panel, history_panel],
-        spacing=20,
-        alignment=ft.MainAxisAlignment.CENTER
-    )
-    page.add(main_layout)
-
-ft.app(target=main, view=ft.AppView.WEB_BROWSER)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
